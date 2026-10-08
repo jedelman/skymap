@@ -75,7 +75,8 @@ Locations use the Lexicon Community's `community.lexicon.location.*` types
 ```
 lexicons/          skymap's lexicons + vendored community ones (tests validate against these)
 app/               the client: React + Vite + MapLibre
-app/src-tauri/     Tauri 2 shell: packages the client for Android, adds geolocation
+app/src-tauri/     Tauri 2 shell: packages the client for Android; geolocation, system browser, deep links
+site/              skymap.jason-edelman.org: OAuth client metadata + landing page (wrangler.jsonc)
 app/src-tauri/gen/android/   generated Gradle project (committed: the manifest carries location permissions)
 ```
 
