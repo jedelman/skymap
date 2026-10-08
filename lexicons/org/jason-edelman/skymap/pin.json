@@ -1,0 +1,38 @@
+{
+  "lexicon": 1,
+  "id": "org.jason-edelman.skymap.pin",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A place placed on a layer, with the author's own note about it.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["layer", "location", "createdAt"],
+        "properties": {
+          "layer": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "The org.jason-edelman.skymap.layer this pin belongs to."
+          },
+          "location": {
+            "type": "union",
+            "refs": [
+              "community.lexicon.location.geo",
+              "community.lexicon.location.address",
+              "community.lexicon.location.fsq",
+              "community.lexicon.location.hthree"
+            ]
+          },
+          "osm": {
+            "type": "string",
+            "description": "OpenStreetMap element this pin refers to, as type/id, e.g. way/426162558.",
+            "maxLength": 64
+          },
+          "note": { "type": "string", "maxLength": 3000, "maxGraphemes": 300 },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"What the skymap web client may ask the native side for.","local":true,"windows":["main"],"permissions":["core:default","geolocation:default"]}}

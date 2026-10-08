@@ -1,0 +1,25 @@
+{
+  "lexicon": 1,
+  "id": "org.jason-edelman.skymap.layer",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A layer: one person's re-reading of the city. A named set of pins that anyone can subscribe to and draw over the base map.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "createdAt"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 640, "maxGraphemes": 64 },
+          "description": { "type": "string", "maxLength": 3000, "maxGraphemes": 300 },
+          "color": {
+            "type": "string",
+            "description": "Display hint, #rrggbb. Clients may ignore it.",
+            "maxLength": 7
+          },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    }
+  }
+}
