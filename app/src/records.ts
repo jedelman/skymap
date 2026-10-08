@@ -7,6 +7,7 @@ import { cellToBoundary, cellToLatLng, getResolution, isValidCell, latLngToCell 
 export const NSID = {
   layer: "org.jason-edelman.skymap.layer",
   pin: "org.jason-edelman.skymap.pin",
+  generator: "org.jason-edelman.skymap.generator",
   event: "community.lexicon.calendar.event",
   geo: "community.lexicon.location.geo",
   hthree: "community.lexicon.location.hthree",
@@ -174,3 +175,83 @@ export function eventPlacement(e: EventRecord): Placement | null {
 export function cellResolution(cell: string): number | null {
   return isValidCell(cell) ? getResolution(cell) : null;
 }
+
+// ---------- editing ----------
+
+/** An edited layer keeps its identity (createdAt); only the fields given change. */
+export function editLayer(prev: LayerRecord, changes: { name?: string; description?: string; color?: string }): LayerRecord {
+  const next = makeLayer({
+    name: changes.name ?? prev.name,
+    description: changes.description ?? prev.description,
+    color: changes.color ?? prev.color,
+  });
+  return { ...next, createdAt: prev.createdAt };
+}
+
+/** Pins can change note and layer. The place itself doesn't move: that's a different pin. */
+export function editPin(prev: PinRecord, changes: { note?: string; layer?: StrongRef }): PinRecord {
+  const next: PinRecord = { ...prev, layer: changes.layer ?? prev.layer };
+  const note = (changes.note ?? prev.note ?? "").trim();
+  if (note) next.note = note;
+  else delete next.note;
+  return next;
+}
+
+/** Events can change name, description and times; where stays as published. */
+export function editEvent(prev: EventRecord, changes: { name?: string; description?: string; startsAt?: string; endsAt?: string | null }): EventRecord {
+  const name = (changes.name ?? prev.name).trim();
+  if (!name) throw new Error("An event needs a name");
+  const next: EventRecord = { ...prev, name };
+  if (changes.startsAt) next.startsAt = new Date(changes.startsAt).toISOString();
+  if (changes.endsAt === null) delete next.endsAt;
+  else if (changes.endsAt) next.endsAt = new Date(changes.endsAt).toISOString();
+  const description = (changes.description ?? prev.description ?? "").trim();
+  if (description) next.description = description;
+  else delete next.description;
+  return next;
+}
+
+// ---------- generators ----------
+
+export const GENERATOR_NSID = NSID.generator;
+export const RULE = { union: `${GENERATOR_NSID}#union`, consensus: `${GENERATOR_NSID}#consensus` } as const;
+
+export type GeneratorSource = { $type: `${typeof GENERATOR_NSID}#authorSource`; did: string } | { $type: `${typeof GENERATOR_NSID}#layerSource`; layer: StrongRef };
+
+export interface GeneratorRecord {
+  name: string;
+  description?: string;
+  color?: string;
+  sources: GeneratorSource[];
+  rule: string;
+  minAuthors?: number;
+  createdAt: string;
+}
+
+export const authorSource = (did: string): GeneratorSource => ({ $type: `${GENERATOR_NSID}#authorSource`, did });
+export const layerSource = (layer: StrongRef): GeneratorSource => ({ $type: `${GENERATOR_NSID}#layerSource`, layer });
+
+export function makeGenerator(input: {
+  name: string;
+  description?: string;
+  color?: string;
+  sources: GeneratorSource[];
+  rule: "union" | "consensus";
+  minAuthors?: number;
+}): GeneratorRecord {
+  const name = input.name.trim();
+  if (!name) throw new Error("A generator needs a name");
+  if (input.sources.length === 0) throw new Error("Pick at least one source");
+  if (input.sources.length > 50) throw new Error("At most 50 sources");
+  const out: GeneratorRecord = { name, sources: input.sources, rule: RULE[input.rule], createdAt: now() };
+  if (input.rule === "consensus") {
+    const authors = new Set(input.sources.map((s) => ("did" in s ? s.did : s.layer.uri.split("/")[2])));
+    const min = Math.max(1, Math.min(50, Math.floor(input.minAuthors ?? 2)));
+    if (min > authors.size) throw new Error(`Needs ${min} authors but the sources only have ${authors.size}`);
+    out.minAuthors = min;
+  }
+  if (input.description?.trim()) out.description = input.description.trim();
+  if (input.color && /^#[0-9a-f]{6}$/i.test(input.color)) out.color = input.color.toLowerCase();
+  return out;
+}
+

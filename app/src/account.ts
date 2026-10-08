@@ -19,11 +19,11 @@ import {
 import { NSID } from "./records";
 
 /**
- * Least privilege: skymap may write its own record types and events, and
- * nothing else. It can't post to your Bluesky feed, follow anyone, or touch
- * your profile.
+ * Least privilege: skymap may write its own record types (layers, pins,
+ * generators) and events, and nothing else. It can't post to your Bluesky
+ * feed, follow anyone, or touch your profile.
  */
-export const SKYMAP_SCOPE = ["atproto", `repo:${NSID.layer}`, `repo:${NSID.pin}`, `repo:${NSID.event}`].join(" ");
+export const SKYMAP_SCOPE = ["atproto", `repo:${NSID.layer}`, `repo:${NSID.pin}`, `repo:${NSID.generator}`, `repo:${NSID.event}`].join(" ");
 
 export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -130,4 +130,18 @@ export async function createRecord(
 export async function deleteRecord(s: OAuthSession, uri: string, onSession: (s: OAuthSession) => void): Promise<void> {
   const { collection, rkey } = parseAtUri(uri);
   await pdsCall(f, keys, s, "com.atproto.repo.deleteRecord", { body: { repo: s.did, collection, rkey } }, onSession);
+}
+
+/** Replaces a record, but only if it hasn't changed since we read it (swapRecord). */
+export async function putRecord(
+  s: OAuthSession,
+  uri: string,
+  cid: string,
+  record: Record<string, unknown>,
+  onSession: (s: OAuthSession) => void,
+): Promise<{ uri: string; cid: string }> {
+  const { collection, rkey } = parseAtUri(uri);
+  return pdsCall(f, keys, s, "com.atproto.repo.putRecord", {
+    body: { repo: s.did, collection, rkey, record: { $type: collection, ...record }, swapRecord: cid },
+  }, onSession);
 }

@@ -15,7 +15,7 @@ being enclosed by a few platforms, and whose own practice (the address drop: the
 party is public, the location goes to the list) already has the public/private
 split this design needs.
 
-## What the prototype does (v0.0.2, Android first)
+## What the app does (v0.0.3, Android first)
 
 - **Map**: MapLibre over OpenFreeMap's OSM vector tiles, no key.
 - **Search and long-press**: places from OpenStreetMap via Photon.
@@ -24,17 +24,30 @@ split this design needs.
   pins and events (granular `repo:` scopes), never posts, follows or profile
   changes. Tokens are DPoP-bound to a non-extractable key on the device. Records go
   straight to your own PDS; there is no skymap server.
-- **Layers**: make a named layer, pin places to it with a note.
+- **Layers**: make a named layer, pin places to it with a note. Edit or delete
+  layers, pins and events later (edits use `swapRecord`, so two devices can't
+  silently overwrite each other).
 - **Read anyone's map**: add a handle; their layers and upcoming events load from
   their PDS and draw over yours. Toggle each layer.
+- **Find people who map**: the atproto relay already lists every repo holding a
+  record type (`com.atproto.sync.listReposByCollection`), so skymap asks it who
+  publishes layers or calendar events (Smoke Signal's included) and intersects
+  that with who you follow on Bluesky. No skymap index, no server learning your graph.
+- **This week**: every event in the next seven days across the maps you read,
+  by day, with distance from the map; optionally only within 25 km.
+- **Map generators**: a published recipe over other people's layers. *Overlap*
+  keeps places at least N of the chosen people pinned; *Everything* is the union.
+  Every phone that subscribes evaluates it itself, over repos it reads directly,
+  so there's no ranking server to trust and no average over people you didn't
+  choose. Places match by OSM element, else by a ~25 m H3 cell.
 - **Events with the address drop**: post a `community.lexicon.calendar.event`
   with either the exact spot, or **area only**: the record carries just the
   H3 cell (resolution 8, about 0.7 km²) and the map draws the hexagon. The exact
   coordinate never leaves the phone.
 
 Not built yet: Tables over atproto-iroh (private check-ins and delivering the
-address to the list), the did:iroh ↔ did:plc vault, map generators (published
-rankings, on the feed-generator model), routing.
+address to the list), the did:iroh ↔ did:plc vault, hosted generators (a
+service DID that ranks, for recipes too heavy for a phone), routing.
 
 ## Sign-in (OAuth)
 
@@ -65,6 +78,7 @@ loopback redirect lands on 127.0.0.1, and storage is per-origin).
 |---|---|---|
 | `org.jason-edelman.skymap.layer` | A named layer | `lexicons/org/jason-edelman/skymap/layer.json` |
 | `org.jason-edelman.skymap.pin` | A place on a layer, with a note | `lexicons/org/jason-edelman/skymap/pin.json` |
+| `org.jason-edelman.skymap.generator` | A recipe over others' layers (union or overlap) | `lexicons/org/jason-edelman/skymap/generator.json` |
 | `community.lexicon.calendar.event` | Events (shared with Smoke Signal and other event apps) | Lexicon Community, vendored in `lexicons/community/` |
 
 Locations use the Lexicon Community's `community.lexicon.location.*` types
@@ -114,6 +128,10 @@ side-load it, or a real release keystore to distribute it. If Gradle fails with
   also lets skymap edit events other apps wrote to your account.
 - **Public Photon and OpenFreeMap** are fine for a prototype, not for a product
   (fair-use limits, no SLA). Self-host Photon; move tiles to Protomaps on R2.
+- **A pin is drawn only on its own author's layer.** Anyone can write a pin that
+  points at your layer; skymap ignores it, and generators ignore it too.
+- **Discovery is as complete as the relay.** It asks one relay
+  (relay1.us-east.bsky.network) and caps how many pages it reads.
 - **Everything outside Tables is public**: pins, layers and events are readable by
   anyone, forever cached by whoever indexed them.
 

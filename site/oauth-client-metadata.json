@@ -3,10 +3,17 @@
   "client_name": "skymap",
   "client_uri": "https://skymap.jason-edelman.org",
   "application_type": "native",
-  "grant_types": ["authorization_code", "refresh_token"],
-  "response_types": ["code"],
-  "redirect_uris": ["org.jason-edelman.skymap:/oauth/callback"],
-  "scope": "atproto repo:org.jason-edelman.skymap.layer repo:org.jason-edelman.skymap.pin repo:community.lexicon.calendar.event",
+  "grant_types": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "response_types": [
+    "code"
+  ],
+  "redirect_uris": [
+    "org.jason-edelman.skymap:/oauth/callback"
+  ],
+  "scope": "atproto repo:org.jason-edelman.skymap.layer repo:org.jason-edelman.skymap.pin repo:org.jason-edelman.skymap.generator repo:community.lexicon.calendar.event",
   "token_endpoint_auth_method": "none",
   "dpop_bound_access_tokens": true
 }

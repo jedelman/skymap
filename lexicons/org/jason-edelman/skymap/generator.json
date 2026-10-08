@@ -1,0 +1,51 @@
+{
+  "lexicon": 1,
+  "id": "org.jason-edelman.skymap.generator",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A map generator: a published recipe over other people's layers. Every reader evaluates it on their own device; there is no ranking server.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "sources", "rule", "createdAt"],
+        "properties": {
+          "name": { "type": "string", "maxLength": 640, "maxGraphemes": 64 },
+          "description": { "type": "string", "maxLength": 3000, "maxGraphemes": 300 },
+          "color": { "type": "string", "maxLength": 7 },
+          "sources": {
+            "type": "array",
+            "minLength": 1,
+            "maxLength": 50,
+            "items": { "type": "union", "refs": ["#authorSource", "#layerSource"] }
+          },
+          "rule": {
+            "type": "string",
+            "knownValues": ["org.jason-edelman.skymap.generator#union", "org.jason-edelman.skymap.generator#consensus"]
+          },
+          "minAuthors": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "For #consensus: how many distinct source authors must have pinned a place."
+          },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    },
+    "authorSource": {
+      "type": "object",
+      "description": "Every layer an account publishes.",
+      "required": ["did"],
+      "properties": { "did": { "type": "string", "format": "did" } }
+    },
+    "layerSource": {
+      "type": "object",
+      "description": "One specific layer.",
+      "required": ["layer"],
+      "properties": { "layer": { "type": "ref", "ref": "com.atproto.repo.strongRef" } }
+    },
+    "union": { "type": "token", "description": "Every place pinned in any source." },
+    "consensus": { "type": "token", "description": "Places pinned by at least minAuthors distinct authors across the sources." }
+  }
+}

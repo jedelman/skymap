@@ -1,35 +1,65 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Feature, FeatureCollection } from "geojson";
 import type { RepoRecord } from "./atproto";
-import { createRecord, deleteRecord, listenForSignIn, loadSession, saveSession, signOut, startSignIn } from "./account";
+import { createRecord, deleteRecord, listenForSignIn, loadSession, putRecord, saveSession, signOut, startSignIn } from "./account";
 import type { OAuthSession as Session } from "./oauth";
 import { MapView, type MapApi } from "./MapView";
-import { layerColor, loadAuthor, upcoming, PALETTE, type AuthorData } from "./data";
-import { eventPlacement, makeEvent, makeLayer, makePin, NSID, placementOf, type EventRecord, type LayerRecord, type PinRecord } from "./records";
-import { reverseGeocode, searchPlaces, type Place } from "./search";
+import { layerColor, loadAuthor, thisWeek, upcoming, type AuthorData } from "./data";
+import { discover, type Discovery } from "./discover";
+import { evaluate, sourceDids, type GeneratedPlace } from "./generators";
+import {
+  authorSource,
+  editEvent,
+  editLayer,
+  editPin,
+  eventPlacement,
+  layerSource,
+  makeEvent,
+  makeGenerator,
+  makeLayer,
+  makePin,
+  NSID,
+  placementOf,
+  type EventRecord,
+  type GeneratorRecord,
+  type LayerRecord,
+  type PinRecord,
+} from "./records";
+import { reverseGeocode, type Place } from "./search";
 import { load, save } from "./storage";
 import { locate } from "./locate";
+import { EVENT_COLOR, EventForm, LayersSheet, MeSheet, PlaceSheet, SearchBar } from "./ui/parts";
+import { DiscoverSheet, EventSheet, GeneratedPlaceSheet, GeneratorForm, PinSheet, WeekSheet } from "./ui/sheets";
 
 type Sheet =
   | { kind: "place"; place: Place }
   | { kind: "pin"; uri: string }
   | { kind: "event"; uri: string }
+  | { kind: "gen"; uri: string }
   | { kind: "newEvent"; place: Place }
+  | { kind: "newGenerator" }
   | { kind: "layers" }
+  | { kind: "week" }
+  | { kind: "discover" }
   | { kind: "me" };
 
 const f: typeof fetch = (...a) => fetch(...a);
-const EVENT_COLOR = "#ff4fa3";
+const GEN_COLOR = "#f5e663";
 
 export function App() {
   const [session, setSessionState] = useState<Session | null>(() => loadSession());
   const [follows, setFollows] = useState<string[]>(() => load("skymap.follows", []));
   const [hidden, setHidden] = useState<string[]>(() => load("skymap.hidden", []));
+  const [enabledGens, setEnabledGens] = useState<string[]>(() => load("skymap.generators", []));
+  const [lookupHandle, setLookupHandle] = useState<string | null>(() => load("skymap.lookupHandle", null));
+  const [nearOnly, setNearOnly] = useState<boolean>(() => load("skymap.weekNearOnly", false));
+  // Every repo loaded on this device: the ones you read, plus generator sources.
   const [authors, setAuthors] = useState<Record<string, AuthorData>>({});
   const [sheet, setSheet] = useState<Sheet | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const mapApi = useRef<MapApi | null>(null);
+  const discovery = useRef<{ actor: string | null; result: Promise<Discovery> } | null>(null);
 
   const setSession = useCallback((s: Session | null) => {
     saveSession(s);
@@ -39,25 +69,39 @@ export function App() {
     setToast(msg);
     setTimeout(() => setToast((t) => (t === msg ? null : t)), 4000);
   }, []);
+  const persist = <T,>(key: string, set: (v: T) => void) => (v: T) => {
+    save(key, v);
+    set(v);
+  };
 
-  const refreshAuthor = useCallback(
-    async (handleOrDid: string) => {
-      const data = await loadAuthor(f, handleOrDid);
-      setAuthors((prev) => ({ ...prev, [data.identity.did]: data }));
-      return data;
-    },
-    [],
-  );
+  const refreshAuthor = useCallback(async (handleOrDid: string) => {
+    const data = await loadAuthor(f, handleOrDid);
+    setAuthors((prev) => ({ ...prev, [data.identity.did]: data }));
+    return data;
+  }, []);
 
-  // Read every repo this device follows, plus our own.
+  // Who you read: yourself plus everyone you added.
   const everyone = useMemo(() => [...new Set([...(session ? [session.did] : []), ...follows])], [session, follows]);
+  const reading = useMemo(() => everyone.map((d) => authors[d]).filter(Boolean), [everyone, authors]);
+
+  // Enabled generators, wherever they were published, and the repos they need.
+  const generators = useMemo(() => {
+    const out: RepoRecord<GeneratorRecord>[] = [];
+    for (const a of Object.values(authors)) for (const g of a.generators) if (enabledGens.includes(g.uri)) out.push(g);
+    return out;
+  }, [authors, enabledGens]);
+  const needed = useMemo(() => [...new Set([...everyone, ...generators.flatMap((g) => sourceDids(g.value))])], [everyone, generators]);
+
+  const loading = useRef(new Set<string>());
   useEffect(() => {
-    for (const did of everyone) {
-      if (authors[did]) continue;
-      refreshAuthor(did).catch((e) => say(`Couldn't load ${did}: ${e.message}`));
+    for (const did of needed) {
+      if (authors[did] || loading.current.has(did)) continue;
+      loading.current.add(did);
+      refreshAuthor(did)
+        .catch((e) => say(`Couldn't load ${did}: ${e.message}`))
+        .finally(() => loading.current.delete(did));
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [everyone]);
+  }, [needed, authors, refreshAuthor, say]);
 
   const layersByUri = useMemo(() => {
     const out = new Map<string, { layer: RepoRecord<LayerRecord>; author: AuthorData }>();
@@ -65,36 +109,57 @@ export function App() {
     return out;
   }, [authors]);
 
+  const generated = useMemo(() => {
+    const out = new Map<string, { generator: RepoRecord<GeneratorRecord>; places: GeneratedPlace[] }>();
+    for (const g of generators) out.set(g.uri, { generator: g, places: evaluate(g.value, authors) });
+    return out;
+  }, [generators, authors]);
+
+  // Which generator places each pin feeds, so a pin can lead to the combined view.
+  const pinInGenerators = useMemo(() => {
+    const out = new Map<string, { uri: string; name: string; count: number }[]>();
+    for (const { generator, places } of generated.values())
+      for (const p of places)
+        for (const { pin } of p.pins)
+          out.set(pin.uri, [...(out.get(pin.uri) ?? []), { uri: `${generator.uri}|${p.key}`, name: generator.value.name, count: p.authors.length }]);
+    return out;
+  }, [generated]);
+
   const { pins, areas } = useMemo(() => {
     const pinFeatures: Feature[] = [];
     const areaFeatures: Feature[] = [];
-    for (const a of Object.values(authors)) {
+    const point = (props: Record<string, unknown>, lat: number, lng: number): Feature => ({
+      type: "Feature",
+      properties: props,
+      geometry: { type: "Point", coordinates: [lng, lat] },
+    });
+    for (const a of reading) {
       for (const p of a.pins) {
         const owner = layersByUri.get(p.value.layer?.uri);
-        if (!owner || hidden.includes(owner.layer.uri)) continue;
+        // Draw a pin only on its own author's layer: nobody can post onto your layer.
+        if (!owner || owner.author.identity.did !== a.identity.did || hidden.includes(owner.layer.uri)) continue;
         const at = placementOf(p.value.location);
         if (at?.kind !== "point") continue;
-        pinFeatures.push({
-          type: "Feature",
-          properties: { kind: "pin", uri: p.uri, color: layerColor(owner.layer), title: (p.value.location as { name?: string }).name ?? "" },
-          geometry: { type: "Point", coordinates: [at.lng, at.lat] },
-        });
+        pinFeatures.push(point({ kind: "pin", uri: p.uri, color: layerColor(owner.layer), title: (p.value.location as { name?: string }).name ?? "" }, at.lat, at.lng));
       }
       if (hidden.includes(`events:${a.identity.did}`)) continue;
       for (const e of upcoming(a.events)) {
         const at = eventPlacement(e.value);
         if (!at) continue;
         const props = { kind: "event", uri: e.uri, color: EVENT_COLOR, title: e.value.name };
-        if (at.kind === "area") {
-          areaFeatures.push({ type: "Feature", properties: props, geometry: { type: "Polygon", coordinates: [at.ring] } });
-        } else {
-          pinFeatures.push({ type: "Feature", properties: props, geometry: { type: "Point", coordinates: [at.lng, at.lat] } });
-        }
+        if (at.kind === "area") areaFeatures.push({ type: "Feature", properties: props, geometry: { type: "Polygon", coordinates: [at.ring] } });
+        else pinFeatures.push(point(props, at.lat, at.lng));
+      }
+    }
+    for (const { generator, places } of generated.values()) {
+      for (const p of places) {
+        const title = p.authors.length > 1 ? `${p.name} ×${p.authors.length}` : p.name;
+        pinFeatures.push(point({ kind: "gen", uri: `${generator.uri}|${p.key}`, color: generator.value.color ?? GEN_COLOR, title, count: p.authors.length }, p.lat, p.lng));
       }
     }
     const fc = (features: Feature[]): FeatureCollection => ({ type: "FeatureCollection", features });
     return { pins: fc(pinFeatures), areas: fc(areaFeatures) };
-  }, [authors, layersByUri, hidden]);
+  }, [reading, layersByUri, hidden, generated]);
 
   function findRecord<T>(uri: string, pick: (a: AuthorData) => RepoRecord<T>[]) {
     for (const a of Object.values(authors)) {
@@ -118,16 +183,20 @@ export function App() {
     return () => stop?.();
   }, [setSession, say]);
 
-  /** Runs a write as the signed-in user, keeps refreshed tokens, and reloads their repo. */
+  /** Runs writes as the signed-in user, keeps refreshed tokens, and reloads their repo. */
   async function write(action: (s: Session, keep: (s: Session) => void) => Promise<unknown>, done: string) {
-    if (!session) return setSheet({ kind: "me" });
+    if (!session) {
+      setSheet({ kind: "me" });
+      return false;
+    }
     setBusy(true);
     let latest = session;
+    const keep = (s: Session) => {
+      latest = s;
+      setSession(s);
+    };
     try {
-      await action(session, (s) => {
-        latest = s;
-        setSession(s);
-      });
+      await action(session, keep);
       await refreshAuthor(latest.did);
       say(done);
       return true;
@@ -139,7 +208,23 @@ export function App() {
     }
   }
 
-  const myLayers = session ? authors[session.did]?.layers ?? [] : [];
+  async function read(handleOrDid: string) {
+    setBusy(true);
+    try {
+      const data = await refreshAuthor(handleOrDid);
+      if (!follows.includes(data.identity.did)) persist("skymap.follows", setFollows)([...follows, data.identity.did]);
+      say(`Reading @${data.identity.handle ?? data.identity.did}: ${data.layers.length} layers, ${upcoming(data.events).length} upcoming events`);
+    } catch (e) {
+      say((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const me = session ? authors[session.did] : undefined;
+  const myLayers = me?.layers ?? [];
+  const toggle = (list: string[], v: string) => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
+  const open = (kind: Sheet["kind"]) => setSheet(sheet?.kind === kind ? null : ({ kind } as Sheet));
 
   return (
     <div className="app">
@@ -161,8 +246,10 @@ export function App() {
       />
 
       <nav className="dock">
-        <button onClick={() => setSheet(sheet?.kind === "layers" ? null : { kind: "layers" })}>Layers</button>
+        <button onClick={() => open("week")}>Week</button>
+        <button onClick={() => open("layers")}>Layers</button>
         <button
+          aria-label="Show where I am"
           onClick={async () => {
             try {
               const at = await locate();
@@ -175,9 +262,7 @@ export function App() {
         >
           Here
         </button>
-        <button onClick={() => setSheet(sheet?.kind === "me" ? null : { kind: "me" })}>
-          {session ? `@${session.handle.split(".")[0]}` : "Sign in"}
-        </button>
+        <button onClick={() => open("me")}>{session ? `@${session.handle.split(".")[0]}` : "Sign in"}</button>
       </nav>
 
       {sheet && (
@@ -195,10 +280,10 @@ export function App() {
               onSignIn={() => setSheet({ kind: "me" })}
               onEvent={() => setSheet({ kind: "newEvent", place: sheet.place })}
               onPin={(layer, note) =>
-                write(async (s, keep) => {
-                  const rec = makePin({ layer: { uri: layer.uri, cid: layer.cid }, ...sheet.place, note });
-                  return createRecord(s, NSID.pin, { ...rec }, keep);
-                }, `Pinned to ${layer.value.name}`).then((ok) => ok && setSheet(null))
+                write(
+                  (s, keep) => createRecord(s, NSID.pin, { ...makePin({ layer: { uri: layer.uri, cid: layer.cid }, ...sheet.place, note }) }, keep),
+                  `Pinned to ${layer.value.name}`,
+                ).then((ok) => ok && setSheet(null))
               }
               onNewLayer={() => setSheet({ kind: "layers" })}
             />
@@ -209,32 +294,25 @@ export function App() {
               const found = findRecord<PinRecord>(sheet.uri, (a) => a.pins);
               if (!found) return <p>Pin not found.</p>;
               const { record, author } = found;
-              const layer = layersByUri.get(record.value.layer.uri)?.layer;
-              const loc = record.value.location as { name?: string };
               return (
-                <>
-                  <h2>{loc.name || "Pin"}</h2>
-                  <p className="meta">
-                    on <b>{layer?.value.name ?? "unknown layer"}</b> by @{author.identity.handle ?? author.identity.did}
-                  </p>
-                  {record.value.note && <p className="note">{record.value.note}</p>}
-                  {record.value.osm && (
-                    <p className="meta">
-                      <a href={`https://www.openstreetmap.org/${record.value.osm}`} target="_blank" rel="noreferrer">
-                        OpenStreetMap: {record.value.osm}
-                      </a>
-                    </p>
-                  )}
-                  {session?.did === author.identity.did && (
-                    <button
-                      className="danger"
-                      disabled={busy}
-                      onClick={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Pin deleted").then((ok) => ok && setSheet(null))}
-                    >
-                      Delete pin
-                    </button>
-                  )}
-                </>
+                <PinSheet
+                  key={record.cid}
+                  pin={record}
+                  author={author}
+                  layerName={layersByUri.get(record.value.layer.uri)?.layer.value.name}
+                  mine={session?.did === author.identity.did}
+                  myLayers={myLayers}
+                  busy={busy}
+                  inGenerators={pinInGenerators.get(record.uri) ?? []}
+                  onOpenGenerated={(uri) => setSheet({ kind: "gen", uri })}
+                  onSave={({ note, layer }) =>
+                    write(
+                      (s, keep) => putRecord(s, record.uri, record.cid, { ...editPin(record.value, { note, layer: layer && { uri: layer.uri, cid: layer.cid } }) }, keep),
+                      "Pin saved",
+                    )
+                  }
+                  onDelete={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Pin deleted").then((ok) => ok && setSheet(null))}
+                />
               );
             })()}
 
@@ -243,33 +321,26 @@ export function App() {
               const found = findRecord<EventRecord>(sheet.uri, (a) => a.events);
               if (!found) return <p>Event not found.</p>;
               const { record, author } = found;
-              const at = eventPlacement(record.value);
               return (
-                <>
-                  <h2>{record.value.name}</h2>
-                  <p className="meta">
-                    {formatWhen(record.value.startsAt, record.value.endsAt)} · @{author.identity.handle ?? author.identity.did}
-                  </p>
-                  {record.value.description && <p className="note">{record.value.description}</p>}
-                  {at?.kind === "area" ? (
-                    <p className="drop">
-                      Somewhere in this hexagon. The address goes to the list, not the map. (Tables over atproto-iroh will
-                      carry it. That part isn't built yet.)
-                    </p>
-                  ) : (
-                    <p className="meta">Exact location is public.</p>
-                  )}
-                  {session?.did === author.identity.did && (
-                    <button
-                      className="danger"
-                      disabled={busy}
-                      onClick={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Event deleted").then((ok) => ok && setSheet(null))}
-                    >
-                      Delete event
-                    </button>
-                  )}
-                </>
+                <EventSheet
+                  key={record.cid}
+                  event={record}
+                  author={author}
+                  mine={session?.did === author.identity.did}
+                  busy={busy}
+                  onSave={(changes) => write((s, keep) => putRecord(s, record.uri, record.cid, { ...editEvent(record.value, changes) }, keep), "Event saved")}
+                  onDelete={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Event deleted").then((ok) => ok && setSheet(null))}
+                />
               );
+            })()}
+
+          {sheet.kind === "gen" &&
+            (() => {
+              const [genUri, key] = sheet.uri.split("|");
+              const g = generated.get(genUri);
+              const place = g?.places.find((p) => p.key === key);
+              if (!g || !place) return <p>That place is no longer in the generator.</p>;
+              return <GeneratedPlaceSheet place={place} generator={g.generator} authors={authors} />;
             })()}
 
           {sheet.kind === "newEvent" && (
@@ -277,9 +348,54 @@ export function App() {
               place={sheet.place}
               busy={busy}
               onSubmit={(input) =>
-                write((s, keep) => createRecord(s, NSID.event, { ...makeEvent(input) }, keep), "Event published").then(
-                  (ok) => ok && setSheet(null),
-                )
+                write((s, keep) => createRecord(s, NSID.event, { ...makeEvent(input) }, keep), "Event published").then((ok) => ok && setSheet(null))
+              }
+            />
+          )}
+
+          {sheet.kind === "week" && (
+            <WeekSheet
+              items={thisWeek(reading, mapApi.current?.center())}
+              nearOnly={nearOnly}
+              onNearOnly={persist("skymap.weekNearOnly", setNearOnly)}
+              onOpen={(item) => {
+                const at = eventPlacement(item.event.value);
+                if (at) mapApi.current?.flyTo(at.lat, at.lng, at.kind === "area" ? 14 : 16);
+                setSheet({ kind: "event", uri: item.event.uri });
+              }}
+            />
+          )}
+
+          {sheet.kind === "discover" && (
+            <DiscoverSheet
+              actor={session?.did ?? lookupHandle}
+              onActor={persist("skymap.lookupHandle", setLookupHandle)}
+              reading={everyone}
+              load={(actor) => {
+                if (!discovery.current || discovery.current.actor !== actor) discovery.current = { actor, result: discover(f, actor) };
+                return discovery.current.result;
+              }}
+              onRead={(p) => read(p.did)}
+            />
+          )}
+
+          {sheet.kind === "newGenerator" && (
+            <GeneratorForm
+              authors={reading}
+              busy={busy}
+              onSubmit={(input) =>
+                write(async (s, keep) => {
+                  const g = makeGenerator({
+                    name: input.name,
+                    description: input.description,
+                    color: input.color,
+                    rule: input.rule,
+                    minAuthors: input.minAuthors,
+                    sources: [...input.dids.map(authorSource), ...input.layers.map((l) => layerSource({ uri: l.uri, cid: l.cid }))],
+                  });
+                  const ref = await createRecord(s, NSID.generator, { ...g }, keep);
+                  persist("skymap.generators", setEnabledGens)([...enabledGens, ref.uri]);
+                }, `Generator “${input.name}” published`).then((ok) => ok && setSheet({ kind: "layers" }))
               }
             />
           )}
@@ -287,43 +403,39 @@ export function App() {
           {sheet.kind === "layers" && (
             <LayersSheet
               session={session}
-              authors={authors}
+              authors={reading}
               hidden={hidden}
+              enabledGenerators={enabledGens}
               busy={busy}
-              onToggle={(key) => {
-                const next = hidden.includes(key) ? hidden.filter((k) => k !== key) : [...hidden, key];
-                save("skymap.hidden", next);
-                setHidden(next);
-              }}
+              onToggle={(key) => persist("skymap.hidden", setHidden)(toggle(hidden, key))}
+              onToggleGenerator={(uri) => persist("skymap.generators", setEnabledGens)(toggle(enabledGens, uri))}
               onCreate={(name, description, color) =>
                 write((s, keep) => createRecord(s, NSID.layer, { ...makeLayer({ name, description, color }) }, keep), `Layer “${name}” created`)
               }
-              onFollow={async (handle) => {
-                setBusy(true);
-                try {
-                  const data = await refreshAuthor(handle);
-                  if (!follows.includes(data.identity.did)) {
-                    const next = [...follows, data.identity.did];
-                    save("skymap.follows", next);
-                    setFollows(next);
-                  }
-                  say(`Reading @${data.identity.handle ?? data.identity.did}: ${data.layers.length} layers, ${upcoming(data.events).length} upcoming events`);
-                } catch (e) {
-                  say((e as Error).message);
-                } finally {
-                  setBusy(false);
-                }
+              onEditLayer={(layer, changes) =>
+                write((s, keep) => putRecord(s, layer.uri, layer.cid, { ...editLayer(layer.value, changes) }, keep), "Layer saved")
+              }
+              onDeleteLayer={(layer) => {
+                write(async (s, keep) => {
+                  let cur = s;
+                  const k = (n: Session) => {
+                    cur = n;
+                    keep(n);
+                  };
+                  for (const p of me?.pins.filter((p) => p.value.layer.uri === layer.uri) ?? []) await deleteRecord(cur, p.uri, k);
+                  await deleteRecord(cur, layer.uri, k);
+                }, `Deleted “${layer.value.name}”`);
               }}
-              onUnfollow={(did) => {
-                const next = follows.filter((d) => d !== did);
-                save("skymap.follows", next);
-                setFollows(next);
-                setAuthors((prev) => {
-                  const { [did]: _gone, ...rest } = prev;
-                  return rest;
-                });
-              }}
-              onRefresh={() => Promise.all(everyone.map((d) => refreshAuthor(d).catch(() => null))).then(() => say("Refreshed"))}
+              onNewGenerator={() => setSheet({ kind: "newGenerator" })}
+              onDeleteGenerator={(uri) =>
+                write((s, keep) => deleteRecord(s, uri, keep), "Generator deleted").then(
+                  (ok) => ok && persist("skymap.generators", setEnabledGens)(enabledGens.filter((u) => u !== uri)),
+                )
+              }
+              onFollow={read}
+              onUnfollow={(did) => persist("skymap.follows", setFollows)(follows.filter((d) => d !== did))}
+              onDiscover={() => setSheet({ kind: "discover" })}
+              onRefresh={() => Promise.all(needed.map((d) => refreshAuthor(d).catch(() => null))).then(() => say("Refreshed"))}
             />
           )}
 
@@ -353,321 +465,5 @@ export function App() {
 
       {toast && <div className="toast">{toast}</div>}
     </div>
-  );
-}
-
-function formatWhen(start?: string, end?: string) {
-  if (!start) return "date unknown";
-  const s = new Date(start);
-  const day = s.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
-  const time = (d: Date) => d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-  return end ? `${day}, ${time(s)}–${time(new Date(end))}` : `${day}, ${time(s)}`;
-}
-
-function SearchBar({ near, onPick, onError }: { near(): { lat: number; lng: number } | undefined; onPick(p: Place): void; onError(m: string): void }) {
-  const [q, setQ] = useState("");
-  const [results, setResults] = useState<Place[]>([]);
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    if (!q.trim()) return;
-    try {
-      setResults(await searchPlaces(f, q.trim(), near()));
-    } catch (err) {
-      onError((err as Error).message);
-    }
-  }
-  return (
-    <div className="search">
-      <form onSubmit={submit}>
-        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search places" enterKeyHint="search" />
-      </form>
-      {results.length > 0 && (
-        <ul className="results">
-          {results.map((r, i) => (
-            <li key={i}>
-              <button
-                onClick={() => {
-                  setResults([]);
-                  onPick(r);
-                }}
-              >
-                <b>{r.name}</b>
-                <span>{r.label}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-}
-
-function PlaceSheet(props: {
-  place: Place;
-  signedIn: boolean;
-  layers: RepoRecord<LayerRecord>[];
-  busy: boolean;
-  onSignIn(): void;
-  onPin(layer: RepoRecord<LayerRecord>, note: string): void;
-  onEvent(): void;
-  onNewLayer(): void;
-}) {
-  const { place, layers } = props;
-  const [layerUri, setLayerUri] = useState(layers[0]?.uri ?? "");
-  const [note, setNote] = useState("");
-  const layer = layers.find((l) => l.uri === layerUri) ?? layers[0];
-  return (
-    <>
-      <h2>{place.name}</h2>
-      {place.label && <p className="meta">{place.label}</p>}
-      {!props.signedIn ? (
-        <button onClick={props.onSignIn}>Sign in to pin this or post an event</button>
-      ) : layers.length === 0 ? (
-        <>
-          <button onClick={props.onNewLayer}>Make your first layer</button>
-          <button onClick={props.onEvent}>Post an event here</button>
-        </>
-      ) : (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (layer) props.onPin(layer, note);
-          }}
-        >
-          <label>
-            Layer
-            <select value={layer?.uri} onChange={(e) => setLayerUri(e.target.value)}>
-              {layers.map((l) => (
-                <option key={l.uri} value={l.uri}>
-                  {l.value.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Note
-            <textarea value={note} onChange={(e) => setNote(e.target.value)} maxLength={300} rows={2} placeholder="Why it's on this layer" />
-          </label>
-          <div className="row">
-            <button type="submit" disabled={props.busy}>
-              Pin it
-            </button>
-            <button type="button" onClick={props.onEvent}>
-              Event here
-            </button>
-          </div>
-          <p className="hint">Pins are public, in your own atproto repo.</p>
-        </form>
-      )}
-    </>
-  );
-}
-
-function EventForm({ place, busy, onSubmit }: { place: Place; busy: boolean; onSubmit(input: Parameters<typeof makeEvent>[0]): void }) {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [startsAt, setStartsAt] = useState("");
-  const [endsAt, setEndsAt] = useState("");
-  const [precision, setPrecision] = useState<"area" | "exact">("area");
-  const [showPlaceName, setShowPlaceName] = useState(false);
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        onSubmit({
-          name,
-          description,
-          startsAt,
-          endsAt: endsAt || undefined,
-          lat: place.lat,
-          lng: place.lng,
-          precision,
-          placeName: precision === "exact" || showPlaceName ? place.name : undefined,
-        });
-      }}
-    >
-      <h2>New event</h2>
-      <label>
-        Name
-        <input value={name} onChange={(e) => setName(e.target.value)} required maxLength={100} />
-      </label>
-      <div className="row">
-        <label>
-          Starts
-          <input type="datetime-local" value={startsAt} onChange={(e) => setStartsAt(e.target.value)} required />
-        </label>
-        <label>
-          Ends
-          <input type="datetime-local" value={endsAt} onChange={(e) => setEndsAt(e.target.value)} />
-        </label>
-      </div>
-      <label>
-        Description
-        <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} maxLength={3000} />
-      </label>
-      <fieldset>
-        <legend>Who sees where</legend>
-        <label className="choice">
-          <input type="radio" checked={precision === "area"} onChange={() => setPrecision("area")} />
-          <span>
-            <b>Area only</b> — the map shows a hexagon of about 0.7 km². The address stays on this phone.
-          </span>
-        </label>
-        {precision === "area" && (
-          <label className="choice sub">
-            <input type="checkbox" checked={showPlaceName} onChange={(e) => setShowPlaceName(e.target.checked)} />
-            <span>Also publish the place name “{place.name}”</span>
-          </label>
-        )}
-        <label className="choice">
-          <input type="radio" checked={precision === "exact"} onChange={() => setPrecision("exact")} />
-          <span>
-            <b>Exact</b> — anyone can see the spot: {place.name}
-          </span>
-        </label>
-      </fieldset>
-      <button type="submit" disabled={busy}>
-        Publish
-      </button>
-      <p className="hint">Published as a community.lexicon.calendar.event, so other atproto event apps can read it.</p>
-    </form>
-  );
-}
-
-function LayersSheet(props: {
-  session: Session | null;
-  authors: Record<string, AuthorData>;
-  hidden: string[];
-  busy: boolean;
-  onToggle(key: string): void;
-  onCreate(name: string, description: string, color: string): Promise<unknown>;
-  onFollow(handle: string): void;
-  onUnfollow(did: string): void;
-  onRefresh(): void;
-}) {
-  const [handle, setHandle] = useState("");
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [color, setColor] = useState(PALETTE[0]);
-  const list = Object.values(props.authors).sort((a, b) =>
-    a.identity.did === props.session?.did ? -1 : b.identity.did === props.session?.did ? 1 : 0,
-  );
-  return (
-    <>
-      <h2>Layers</h2>
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          if (handle.trim()) props.onFollow(handle);
-          setHandle("");
-        }}
-      >
-        <input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder="Read someone's map: @handle" autoCapitalize="none" />
-        <button type="submit" disabled={props.busy}>
-          Add
-        </button>
-      </form>
-
-      {list.length === 0 && <p className="hint">No maps loaded yet. Add a handle, or sign in to make your own layers.</p>}
-      {list.map((a) => {
-        const mine = a.identity.did === props.session?.did;
-        const evKey = `events:${a.identity.did}`;
-        const nEvents = upcoming(a.events).length;
-        return (
-          <div className="author" key={a.identity.did}>
-            <header>
-              <b>{mine ? "You" : `@${a.identity.handle ?? a.identity.did}`}</b>
-              {!mine && (
-                <button className="link" onClick={() => props.onUnfollow(a.identity.did)}>
-                  stop reading
-                </button>
-              )}
-            </header>
-            {a.layers.map((l) => (
-              <label className="layer" key={l.uri}>
-                <input type="checkbox" checked={!props.hidden.includes(l.uri)} onChange={() => props.onToggle(l.uri)} />
-                <i style={{ background: layerColor(l) }} />
-                <span>
-                  {l.value.name}
-                  <small> · {a.pins.filter((p) => p.value.layer?.uri === l.uri).length}</small>
-                </span>
-              </label>
-            ))}
-            <label className="layer">
-              <input type="checkbox" checked={!props.hidden.includes(evKey)} onChange={() => props.onToggle(evKey)} />
-              <i style={{ background: EVENT_COLOR, borderRadius: 2 }} />
-              <span>
-                Events<small> · {nEvents} upcoming</small>
-              </span>
-            </label>
-          </div>
-        );
-      })}
-
-      {props.session && (
-        <form
-          className="new-layer"
-          onSubmit={async (e) => {
-            e.preventDefault();
-            await props.onCreate(name, description, color);
-            setName("");
-            setDescription("");
-          }}
-        >
-          <h3>New layer</h3>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name: benches nobody moves you from" required maxLength={64} />
-          <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What this layer sees (optional)" maxLength={300} />
-          <div className="swatches">
-            {PALETTE.map((c) => (
-              <button type="button" key={c} aria-label={c} className={c === color ? "on" : ""} style={{ background: c }} onClick={() => setColor(c)} />
-            ))}
-          </div>
-          <button type="submit" disabled={props.busy}>
-            Create layer
-          </button>
-        </form>
-      )}
-      <button className="link" onClick={props.onRefresh}>
-        Refresh all
-      </button>
-    </>
-  );
-}
-
-function MeSheet({ session, busy, onLogin, onLogout }: { session: Session | null; busy: boolean; onLogin(handle: string): void; onLogout(): void }) {
-  const [handle, setHandle] = useState("");
-  if (session)
-    return (
-      <>
-        <h2>@{session.handle}</h2>
-        <p className="meta">Writing to {session.pds}</p>
-        <p className="hint">
-          skymap can write its own layers, pins and events to your account, and nothing else: no posts, follows or profile
-          changes.
-        </p>
-        <button onClick={onLogout}>Sign out</button>
-      </>
-    );
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        onLogin(handle);
-      }}
-    >
-      <h2>Sign in</h2>
-      <label>
-        Your atproto handle
-        <input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder="you.bsky.social" autoCapitalize="none" autoCorrect="off" required />
-      </label>
-      <button type="submit" disabled={busy}>
-        Continue
-      </button>
-      <p className="hint">
-        You'll approve skymap on your own server's sign-in page; skymap never sees your password. It asks to write only
-        its own layers, pins and events.
-      </p>
-    </form>
   );
 }

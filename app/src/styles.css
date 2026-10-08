@@ -135,3 +135,35 @@ legend { color: var(--muted); font-size: 13px; padding: 0 4px; }
 
 /* Long-press drops a pin; don't let the WebView select text or pop a callout instead. */
 .map { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+
+/* ---- lists inside sheets ---- */
+.dock button { padding: 10px 14px; }
+.day h3 { margin: 10px 0 4px; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .04em; }
+.item { display: flex; flex-direction: column; align-items: flex-start; width: 100%; text-align: left; background: var(--panel-2); border-radius: 10px; margin-bottom: 6px; padding: 10px 12px; min-height: 0; }
+.item span { color: var(--muted); font-size: 13px; }
+.person { display: flex; align-items: center; gap: 10px; min-height: 52px; }
+.person img, .person .avatar { width: 36px; height: 36px; border-radius: 50%; flex: none; background: var(--panel-2); object-fit: cover; }
+.person .who { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.person .who b, .person .who small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.person .who small { color: var(--muted); }
+.person button { flex: none; min-height: 36px; padding: 6px 14px; }
+.voice { border-left: 2px solid var(--line); padding-left: 10px; }
+.voice small { color: var(--muted); }
+.layer-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.layer-row .layer { flex: 1; min-width: 0; }
+.layer span { display: flex; flex-direction: column; }
+.layer span small.desc { color: var(--muted); font-size: 12px; }
+.layer i.gen { background: transparent; border: 2px solid; }
+.editor { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin: 4px 0; }
+.source { border-bottom: 1px solid var(--line); padding: 4px 0; }
+.source:last-child { border-bottom: none; }
+input.num { width: 56px; display: inline-block; padding: 4px 6px; text-align: center; }
+
+/* The dock stays reachable over any open sheet; sheets leave room for it. */
+.dock { z-index: 5; }
+.sheet { padding-bottom: calc(env(safe-area-inset-bottom) + 84px); }
+.toast { z-index: 6; bottom: calc(env(safe-area-inset-bottom) + 76px); }
+.dock { bottom: calc(env(safe-area-inset-bottom) + 34px); gap: 6px; }
+.dock button { white-space: nowrap; min-width: 64px; }
+.sheet { padding-bottom: calc(env(safe-area-inset-bottom) + 104px); }
+.toast { bottom: calc(env(safe-area-inset-bottom) + 96px); }

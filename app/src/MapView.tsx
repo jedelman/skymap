@@ -19,7 +19,7 @@ interface Props {
   pins: FeatureCollection;
   areas: FeatureCollection;
   onReady(api: MapApi): void;
-  onFeature(kind: "pin" | "event", uri: string): void;
+  onFeature(kind: "pin" | "event" | "gen", uri: string): void;
   onLongPress(lat: number, lng: number): void;
 }
 
@@ -46,6 +46,8 @@ export function MapView({ pins, areas, onReady, onFeature, onLongPress }: Props)
       pitchWithRotate: false,
     });
     map.current = m;
+    // Dev builds only: lets browser tests find features on the canvas.
+    if (import.meta.env.DEV) (window as unknown as { __skymapMap?: MLMap }).__skymapMap = m;
     m.touchPitch.disable();
 
     m.on("load", () => {
@@ -73,10 +75,25 @@ export function MapView({ pins, areas, onReady, onFeature, onLongPress }: Props)
         filter: ["==", ["get", "kind"], "event"],
         paint: { "circle-radius": 14, "circle-color": ["get", "color"], "circle-opacity": 0.25 },
       });
+      // Generator output: a ring that grows with how many people agree on the place.
+      m.addLayer({
+        id: "gen-ring",
+        type: "circle",
+        source: "pins",
+        filter: ["==", ["get", "kind"], "gen"],
+        paint: {
+          "circle-radius": ["+", 7, ["*", 3, ["min", ["coalesce", ["get", "count"], 1], 6]]],
+          "circle-color": ["get", "color"],
+          "circle-opacity": 0.22,
+          "circle-stroke-color": ["get", "color"],
+          "circle-stroke-width": 2,
+        },
+      });
       m.addLayer({
         id: "pins-dot",
         type: "circle",
         source: "pins",
+        filter: ["!=", ["get", "kind"], "gen"],
         paint: {
           "circle-radius": ["case", ["==", ["get", "kind"], "event"], 7, 6],
           "circle-color": ["get", "color"],
@@ -91,6 +108,8 @@ export function MapView({ pins, areas, onReady, onFeature, onLongPress }: Props)
         minzoom: 13,
         layout: {
           "text-field": ["get", "title"],
+          // Must be a font the basemap's glyph server has; MapLibre's default isn't.
+          "text-font": ["Noto Sans Regular"],
           "text-size": 12,
           "text-offset": [0, 1.2],
           "text-anchor": "top",
@@ -106,11 +125,17 @@ export function MapView({ pins, areas, onReady, onFeature, onLongPress }: Props)
       });
       loaded.current = true;
 
-      for (const id of ["pins-dot", "pins-halo", "areas-fill"]) {
-        m.on("click", id, (e) => {
-          const p = e.features?.[0]?.properties as { kind: "pin" | "event"; uri: string } | undefined;
-          if (p) cb.current.onFeature(p.kind, p.uri);
-        });
+      // One handler for all taps, so overlapping features resolve by priority
+      // (a pin beats the generator ring around it beats the area under both)
+      // instead of whichever layer's listener happened to fire last.
+      const TAPPABLE = ["pins-dot", "gen-ring", "pins-halo", "areas-fill"];
+      m.on("click", (e) => {
+        const hits = m.queryRenderedFeatures(e.point, { layers: TAPPABLE });
+        hits.sort((a, b) => TAPPABLE.indexOf(a.layer.id) - TAPPABLE.indexOf(b.layer.id));
+        const p = hits[0]?.properties as { kind: "pin" | "event" | "gen"; uri: string } | undefined;
+        if (p) cb.current.onFeature(p.kind, p.uri);
+      });
+      for (const id of TAPPABLE) {
         m.on("mouseenter", id, () => (m.getCanvas().style.cursor = "pointer"));
         m.on("mouseleave", id, () => (m.getCanvas().style.cursor = ""));
       }
