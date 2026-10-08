@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { Feature, FeatureCollection } from "geojson";
-import { createRecord, deleteRecord, login, type RepoRecord, type Session } from "./atproto";
+import type { RepoRecord } from "./atproto";
+import { createRecord, deleteRecord, listenForSignIn, loadSession, saveSession, signOut, startSignIn } from "./account";
+import type { OAuthSession as Session } from "./oauth";
 import { MapView, type MapApi } from "./MapView";
 import { layerColor, loadAuthor, upcoming, PALETTE, type AuthorData } from "./data";
 import { eventPlacement, makeEvent, makeLayer, makePin, NSID, placementOf, type EventRecord, type LayerRecord, type PinRecord } from "./records";
@@ -20,7 +22,7 @@ const f: typeof fetch = (...a) => fetch(...a);
 const EVENT_COLOR = "#ff4fa3";
 
 export function App() {
-  const [session, setSessionState] = useState<Session | null>(() => load("skymap.session", null));
+  const [session, setSessionState] = useState<Session | null>(() => loadSession());
   const [follows, setFollows] = useState<string[]>(() => load("skymap.follows", []));
   const [hidden, setHidden] = useState<string[]>(() => load("skymap.hidden", []));
   const [authors, setAuthors] = useState<Record<string, AuthorData>>({});
@@ -29,10 +31,10 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const mapApi = useRef<MapApi | null>(null);
 
-  const setSession = (s: Session | null) => {
-    save("skymap.session", s);
+  const setSession = useCallback((s: Session | null) => {
+    saveSession(s);
     setSessionState(s);
-  };
+  }, []);
   const say = useCallback((msg: string) => {
     setToast(msg);
     setTimeout(() => setToast((t) => (t === msg ? null : t)), 4000);
@@ -102,14 +104,31 @@ export function App() {
     return null;
   }
 
-  /** Runs a write as the signed-in user, keeps a refreshed session, and reloads their repo. */
-  async function write(action: (s: Session) => Promise<Session>, done: string) {
+  // The OAuth redirect: a deep link in the app, this page's URL on the web.
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    listenForSignIn(
+      (s) => {
+        setSession(s);
+        say(`Signed in as @${s.handle}`);
+        setSheet(null);
+      },
+      (e) => say(`Sign-in failed: ${e.message}`),
+    ).then((unlisten) => (stop = unlisten));
+    return () => stop?.();
+  }, [setSession, say]);
+
+  /** Runs a write as the signed-in user, keeps refreshed tokens, and reloads their repo. */
+  async function write(action: (s: Session, keep: (s: Session) => void) => Promise<unknown>, done: string) {
     if (!session) return setSheet({ kind: "me" });
     setBusy(true);
+    let latest = session;
     try {
-      const next = await action(session);
-      setSession(next);
-      await refreshAuthor(next.did);
+      await action(session, (s) => {
+        latest = s;
+        setSession(s);
+      });
+      await refreshAuthor(latest.did);
       say(done);
       return true;
     } catch (e) {
@@ -176,9 +195,9 @@ export function App() {
               onSignIn={() => setSheet({ kind: "me" })}
               onEvent={() => setSheet({ kind: "newEvent", place: sheet.place })}
               onPin={(layer, note) =>
-                write(async (s) => {
+                write(async (s, keep) => {
                   const rec = makePin({ layer: { uri: layer.uri, cid: layer.cid }, ...sheet.place, note });
-                  return (await createRecord(f, s, NSID.pin, { ...rec })).session;
+                  return createRecord(s, NSID.pin, { ...rec }, keep);
                 }, `Pinned to ${layer.value.name}`).then((ok) => ok && setSheet(null))
               }
               onNewLayer={() => setSheet({ kind: "layers" })}
@@ -210,7 +229,7 @@ export function App() {
                     <button
                       className="danger"
                       disabled={busy}
-                      onClick={() => write((s) => deleteRecord(f, s, record.uri), "Pin deleted").then((ok) => ok && setSheet(null))}
+                      onClick={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Pin deleted").then((ok) => ok && setSheet(null))}
                     >
                       Delete pin
                     </button>
@@ -244,7 +263,7 @@ export function App() {
                     <button
                       className="danger"
                       disabled={busy}
-                      onClick={() => write((s) => deleteRecord(f, s, record.uri), "Event deleted").then((ok) => ok && setSheet(null))}
+                      onClick={() => write((s, keep) => deleteRecord(s, record.uri, keep), "Event deleted").then((ok) => ok && setSheet(null))}
                     >
                       Delete event
                     </button>
@@ -258,7 +277,7 @@ export function App() {
               place={sheet.place}
               busy={busy}
               onSubmit={(input) =>
-                write(async (s) => (await createRecord(f, s, NSID.event, { ...makeEvent(input) })).session, "Event published").then(
+                write((s, keep) => createRecord(s, NSID.event, { ...makeEvent(input) }, keep), "Event published").then(
                   (ok) => ok && setSheet(null),
                 )
               }
@@ -277,7 +296,7 @@ export function App() {
                 setHidden(next);
               }}
               onCreate={(name, description, color) =>
-                write(async (s) => (await createRecord(f, s, NSID.layer, { ...makeLayer({ name, description, color }) })).session, `Layer “${name}” created`)
+                write((s, keep) => createRecord(s, NSID.layer, { ...makeLayer({ name, description, color }) }, keep), `Layer “${name}” created`)
               }
               onFollow={async (handle) => {
                 setBusy(true);
@@ -312,20 +331,21 @@ export function App() {
             <MeSheet
               session={session}
               busy={busy}
-              onLogin={async (id, pw) => {
+              onLogin={async (handle) => {
                 setBusy(true);
                 try {
-                  const s = await login(f, id, pw);
-                  setSession(s);
-                  say(`Signed in as @${s.handle}`);
-                  setSheet(null);
+                  await startSignIn(handle);
                 } catch (e) {
                   say((e as Error).message);
                 } finally {
                   setBusy(false);
                 }
               }}
-              onLogout={() => setSession(null)}
+              onLogout={() => {
+                const s = session;
+                setSession(null);
+                if (s) signOut(s).catch(() => undefined);
+              }}
             />
           )}
         </section>
@@ -615,14 +635,17 @@ function LayersSheet(props: {
   );
 }
 
-function MeSheet({ session, busy, onLogin, onLogout }: { session: Session | null; busy: boolean; onLogin(id: string, pw: string): void; onLogout(): void }) {
-  const [id, setId] = useState("");
-  const [pw, setPw] = useState("");
+function MeSheet({ session, busy, onLogin, onLogout }: { session: Session | null; busy: boolean; onLogin(handle: string): void; onLogout(): void }) {
+  const [handle, setHandle] = useState("");
   if (session)
     return (
       <>
         <h2>@{session.handle}</h2>
         <p className="meta">Writing to {session.pds}</p>
+        <p className="hint">
+          skymap can write its own layers, pins and events to your account, and nothing else: no posts, follows or profile
+          changes.
+        </p>
         <button onClick={onLogout}>Sign out</button>
       </>
     );
@@ -630,24 +653,20 @@ function MeSheet({ session, busy, onLogin, onLogout }: { session: Session | null
     <form
       onSubmit={(e) => {
         e.preventDefault();
-        onLogin(id, pw);
+        onLogin(handle);
       }}
     >
       <h2>Sign in</h2>
       <label>
-        Handle
-        <input value={id} onChange={(e) => setId(e.target.value)} placeholder="you.bsky.social" autoCapitalize="none" required />
-      </label>
-      <label>
-        App password
-        <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} placeholder="xxxx-xxxx-xxxx-xxxx" required />
+        Your atproto handle
+        <input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder="you.bsky.social" autoCapitalize="none" autoCorrect="off" required />
       </label>
       <button type="submit" disabled={busy}>
-        Sign in
+        Continue
       </button>
       <p className="hint">
-        Use an app password (Bluesky: Settings → Privacy and security → App passwords), never your main password. Prototype only:
-        proper atproto OAuth replaces this.
+        You'll approve skymap on your own server's sign-in page; skymap never sees your password. It asks to write only
+        its own layers, pins and events.
       </p>
     </form>
   );

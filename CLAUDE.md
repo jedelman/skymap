@@ -21,6 +21,13 @@ before changing direction.
 - Privacy-sensitive builders (anything with location) get a test proving what
   is *not* published, not just what is.
 - Location from the device moves the map only. Never write it anywhere.
+- OAuth lives in `app/src/oauth.ts`; keep every credential-touching step there and
+  tested against the nonce-enforcing fake server in `oauth.test.ts`. Ask for the
+  narrowest scopes that work. `site/oauth-client-metadata.json` must match
+  `NATIVE_CLIENT` + `SKYMAP_SCOPE` (a test enforces it); changing scopes means
+  redeploying `site/`.
+- Claude's identity can't complete OAuth (the sign-in page rejects app passwords).
+  Don't retry against it; end-to-end sign-in needs Jason.
 - Don't seed public repos with fake places, reviews or events. Test records go in
   Claude's own repo (`claude.jason-edelman.org`), clearly labelled, and get deleted.
 

@@ -1,19 +1,12 @@
-// Minimal atproto client: identity resolution, app-password sessions, and
-// repo record reads/writes against the user's own PDS. No SDK on purpose;
-// the surface we need is small and every call here is plain XRPC.
+// Minimal atproto client for public reads: identity resolution and repo
+// record listing against each author's own PDS. Writes are authenticated
+// through OAuth (oauth.ts, account.ts). No SDK on purpose; the surface we
+// need is small and every call here is plain XRPC.
 
 const PUBLIC_APPVIEW = "https://public.api.bsky.app";
 const PLC_DIRECTORY = "https://plc.directory";
 
 export type Fetch = typeof fetch;
-
-export interface Session {
-  did: string;
-  handle: string;
-  pds: string;
-  accessJwt: string;
-  refreshJwt: string;
-}
 
 export interface RepoRecord<T = unknown> {
   uri: string;
@@ -35,18 +28,11 @@ async function xrpc<T>(
   f: Fetch,
   base: string,
   method: string,
-  opts: { params?: Record<string, string>; body?: unknown; token?: string; post?: boolean } = {},
+  opts: { params?: Record<string, string> } = {},
 ): Promise<T> {
   const url = new URL(`/xrpc/${method}`, base);
   for (const [k, v] of Object.entries(opts.params ?? {})) url.searchParams.set(k, v);
-  const headers: Record<string, string> = {};
-  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
-  if (opts.body !== undefined) headers["content-type"] = "application/json";
-  const res = await f(url.toString(), {
-    method: opts.post || opts.body !== undefined ? "POST" : "GET",
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-  });
+  const res = await f(url.toString());
   const text = await res.text();
   const json = text ? JSON.parse(text) : {};
   if (!res.ok) throw new XrpcError(res.status, json.error, json.message ?? `${method} failed (${res.status})`);
@@ -104,41 +90,6 @@ export async function resolveIdentity(f: Fetch, handleOrDid: string): Promise<Id
   return { did, handle: handleFromDidDocument(doc), pds: pdsFromDidDocument(doc) };
 }
 
-export async function login(f: Fetch, identifier: string, appPassword: string): Promise<Session> {
-  const id = await resolveIdentity(f, identifier);
-  const out = await xrpc<{ did: string; handle: string; accessJwt: string; refreshJwt: string }>(
-    f,
-    id.pds,
-    "com.atproto.server.createSession",
-    { body: { identifier: id.did, password: appPassword } },
-  );
-  if (out.did !== id.did) throw new Error("PDS returned a session for a different account");
-  return { did: out.did, handle: out.handle, pds: id.pds, accessJwt: out.accessJwt, refreshJwt: out.refreshJwt };
-}
-
-async function refresh(f: Fetch, s: Session): Promise<Session> {
-  const out = await xrpc<{ accessJwt: string; refreshJwt: string }>(f, s.pds, "com.atproto.server.refreshSession", {
-    post: true,
-    token: s.refreshJwt,
-  });
-  return { ...s, accessJwt: out.accessJwt, refreshJwt: out.refreshJwt };
-}
-
-/** Runs an authed call, refreshing once on an expired access token. Returns the (possibly refreshed) session. */
-async function authed<T>(
-  f: Fetch,
-  s: Session,
-  call: (token: string) => Promise<T>,
-): Promise<{ result: T; session: Session }> {
-  try {
-    return { result: await call(s.accessJwt), session: s };
-  } catch (e) {
-    if (!(e instanceof XrpcError) || e.error !== "ExpiredToken") throw e;
-    const next = await refresh(f, s);
-    return { result: await call(next.accessJwt), session: next };
-  }
-}
-
 export async function listRecords<T>(
   f: Fetch,
   pds: string,
@@ -159,29 +110,6 @@ export async function listRecords<T>(
     cursor = res.cursor;
   }
   return out;
-}
-
-export async function createRecord(
-  f: Fetch,
-  s: Session,
-  collection: string,
-  record: Record<string, unknown>,
-): Promise<{ ref: { uri: string; cid: string }; session: Session }> {
-  const { result, session } = await authed(f, s, (token) =>
-    xrpc<{ uri: string; cid: string }>(f, s.pds, "com.atproto.repo.createRecord", {
-      token,
-      body: { repo: s.did, collection, record: { $type: collection, ...record } },
-    }),
-  );
-  return { ref: result, session };
-}
-
-export async function deleteRecord(f: Fetch, s: Session, uri: string): Promise<Session> {
-  const { collection, rkey } = parseAtUri(uri);
-  const { session } = await authed(f, s, (token) =>
-    xrpc(f, s.pds, "com.atproto.repo.deleteRecord", { token, body: { repo: s.did, collection, rkey } }),
-  );
-  return session;
 }
 
 export function parseAtUri(uri: string): { repo: string; collection: string; rkey: string } {

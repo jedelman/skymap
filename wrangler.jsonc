@@ -1,0 +1,9 @@
+// Serves site/ at skymap.jason-edelman.org: the OAuth client metadata the
+// app's client_id points at, plus a one-paragraph landing page. Static
+// assets only, no Worker code. Deploy: npx wrangler deploy (from the repo root).
+{
+  "name": "skymap",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "./site" },
+  "routes": [{ "pattern": "skymap.jason-edelman.org", "custom_domain": true }]
+}
